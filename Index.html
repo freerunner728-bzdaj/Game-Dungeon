@@ -1,0 +1,511 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+<title>Mobile Pixel Dungeon</title>
+<style>
+  html, body { margin:0; height:100%; background:#070a10; color:#e6eef7; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 10px; }
+  canvas { width: 100%; max-width: 700px; height: auto; border:1px solid #223043; background:#05070a; image-rendering: pixelated; display:block; margin: 0 auto; border-radius: 12px; }
+  .hud { max-width: 700px; margin: 10px auto 0; display:flex; gap:10px; flex-wrap:wrap; }
+  .box { flex: 1 1 220px; border:1px solid #223043; border-radius: 12px; padding:10px; background:#0a0f16; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono"; font-size: 12px; white-space: pre-wrap; }
+  .controls { position: sticky; bottom: 10px; max-width: 700px; margin: 10px auto 0; padding: 10px; border-radius: 16px; border:1px solid #223043; background: rgba(10,15,22,.92); backdrop-filter: blur(6px); }
+  .row { display:flex; justify-content:center; gap:10px; margin: 8px 0; }
+  button {
+    width: 70px; height: 70px;
+    border-radius: 16px;
+    border: 1px solid #223043;
+    background:#162033;
+    color:#e6eef7;
+    font-size: 22px;
+    touch-action: manipulation;
+  }
+  button:active { transform: scale(0.98); }
+  .small { width: 110px; font-size: 18px; }
+  .hint { opacity:.85; font-size: 12px; text-align:center; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="c" width="420" height="420"></canvas>
+
+  <div class="hud">
+    <div class="box"><div class="mono" id="stats"></div></div>
+    <div class="box"><div class="mono" id="log"></div></div>
+  </div>
+
+  <div class="controls">
+    <div class="row">
+      <button id="up">↑</button>
+    </div>
+    <div class="row">
+      <button id="left">←</button>
+      <button id="atk">⚔️</button>
+      <button id="right">→</button>
+    </div>
+    <div class="row">
+      <button class="small" id="pot">🧪 Potion</button>
+      <button id="down">↓</button>
+      <button class="small" id="reset">↻ Reset</button>
+    </div>
+    <div class="hint">Touch controls • Attack hits an adjacent enemy • Auto-save enabled</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------- Config ----------
+  const W = 21, H = 21;      // grid size
+  const TS = 20;             // tile size in canvas pixels
+  const CANVAS = document.getElementById("c");
+  const ctx = CANVAS.getContext("2d");
+
+  const statsEl = document.getElementById("stats");
+  const logEl = document.getElementById("log");
+
+  const SAVE_KEY = "pixel_dungeon_save_v2";
+
+  // tiles
+  const T_WALL = 0, T_FLOOR = 1;
+
+  // ---------- State ----------
+  let map = [];
+  let player;
+  let enemies = [];
+  let floorNum = 1;
+
+  // ---------- Helpers ----------
+  const clamp = (v,a,b) => Math.max(a, Math.min(b,v));
+  const rint = (a,b) => Math.floor(Math.random()*(b-a+1))+a;
+  const key = (x,y) => x + "," + y;
+
+  function log(msg){
+    const lines = (logEl.textContent || "").split("\n").filter(Boolean);
+    lines.push(msg);
+    while(lines.length > 9) lines.shift();
+    logEl.textContent = lines.join("\n");
+  }
+
+  function inBounds(x,y){ return x>=0 && y>=0 && x<W && y<H; }
+  function tile(x,y){ return inBounds(x,y) ? map[y][x] : T_WALL; }
+  function walkable(x,y){ return tile(x,y) === T_FLOOR && !enemyAt(x,y); }
+
+  function enemyAt(x,y){
+    return enemies.find(e => e.x===x && e.y===y) || null;
+  }
+
+  function rollDamage(atk, def){
+    const base = atk + rint(0,2);
+    const mitig = def + rint(0,1);
+    return Math.max(1, base - mitig);
+  }
+
+  // ---------- Map generation (rooms + corridor) ----------
+  function genMap(){
+    map = Array.from({length:H}, ()=> Array.from({length:W}, ()=> T_WALL));
+
+    // carve a few rooms
+    const rooms = [];
+    const roomCount = rint(3,5);
+
+    function carveRoom(x,y,w,h){
+      for(let yy=y; yy<y+h; yy++){
+        for(let xx=x; xx<x+w; xx++){
+          if(inBounds(xx,yy)) map[yy][xx] = T_FLOOR;
+        }
+      }
+      rooms.push({x,y,w,h, cx: Math.floor(x+w/2), cy: Math.floor(y+h/2)});
+    }
+
+    for(let i=0;i<roomCount;i++){
+      const rw = rint(5,8), rh = rint(5,8);
+      const rx = rint(1, W-rw-2);
+      const ry = rint(1, H-rh-2);
+
+      // avoid heavy overlap (simple)
+      let ok = true;
+      for(const r of rooms){
+        if(!(rx+rw+1 < r.x || r.x+r.w+1 < rx || ry+rh+1 < r.y || r.y+r.h+1 < ry)) { ok=false; break; }
+      }
+      if(ok) carveRoom(rx,ry,rw,rh);
+    }
+
+    if(rooms.length === 0){
+      carveRoom(2,2,W-4,H-4);
+    }
+
+    // connect rooms
+    for(let i=1;i<rooms.length;i++){
+      const a = rooms[i-1], b = rooms[i];
+      // horizontal then vertical
+      const x1=a.cx, y1=a.cy, x2=b.cx, y2=b.cy;
+      for(let x=Math.min(x1,x2); x<=Math.max(x1,x2); x++) map[y1][x] = T_FLOOR;
+      for(let y=Math.min(y1,y2); y<=Math.max(y1,y2); y++) map[y][x2] = T_FLOOR;
+    }
+
+    // place player at first room center
+    const start = rooms[0];
+    player = {
+      x: start.cx, y: start.cy,
+      hp: 24, maxHp: 24,
+      atk: 5, def: 1,
+      potions: 2,
+      gold: 0
+    };
+
+    // spawn enemies in other rooms
+    enemies = [];
+    const spawnRooms = rooms.slice(1);
+    for(const r of spawnRooms){
+      const count = rint(1,2);
+      for(let i=0;i<count;i++){
+        const ex = rint(r.x+1, r.x+r.w-2);
+        const ey = rint(r.y+1, r.y+r.h-2);
+        if(tile(ex,ey)===T_FLOOR && !(ex===player.x && ey===player.y) && !enemyAt(ex,ey)){
+          enemies.push(makeEnemy(ex,ey));
+        }
+      }
+    }
+
+    if(enemies.length === 0){
+      // ensure at least 2 enemies somewhere
+      for(let i=0;i<2;i++){
+        let ex,ey;
+        do { ex=rint(1,W-2); ey=rint(1,H-2); } while(tile(ex,ey)!==T_FLOOR || enemyAt(ex,ey) || (ex===player.x && ey===player.y));
+        enemies.push(makeEnemy(ex,ey));
+      }
+    }
+  }
+
+  function makeEnemy(x,y){
+    const t = Math.random();
+    if(t < 0.6) return {kind:"slime", x,y, hp: 10 + floorNum, maxHp: 10 + floorNum, atk: 3 + Math.floor(floorNum/2), def: 0};
+    return {kind:"skeleton", x,y, hp: 12 + floorNum, maxHp: 12 + floorNum, atk: 4 + Math.floor(floorNum/2), def: 1};
+  }
+
+  // ---------- Pixel sprites ----------
+  function drawTile(x,y,t){
+    const px = x*TS, py=y*TS;
+    if(t===T_WALL){
+      // chunky wall
+      ctx.fillStyle = "#162033";
+      ctx.fillRect(px,py,TS,TS);
+      ctx.fillStyle = "#0f1824";
+      ctx.fillRect(px+2,py+2,TS-4,TS-4);
+      ctx.fillStyle = "#223043";
+      ctx.fillRect(px+4,py+4,TS-8,TS-8);
+    } else {
+      // floor with subtle noise
+      ctx.fillStyle = "#070d15";
+      ctx.fillRect(px,py,TS,TS);
+      ctx.fillStyle = ( (x+y)%2===0 ? "#0a111b" : "#09101a");
+      ctx.fillRect(px+2,py+2,TS-4,TS-4);
+    }
+  }
+
+  function pix(x,y, color){
+    ctx.fillStyle = color;
+    ctx.fillRect(x,y,2,2); // 2x2 pixels for chunky look
+  }
+
+  function drawPixelPerson(tx,ty){
+    // a 10x10-ish pixel person centered in tile
+    const baseX = tx*TS + 4;
+    const baseY = ty*TS + 3;
+
+    // shadow
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.fillRect(tx*TS+5, ty*TS+15, 10, 3);
+
+    // head
+    for(let y=0;y<3;y++) for(let x=2;x<6;x++) pix(baseX+x*2, baseY+y*2, "#ffd9b3");
+    // hair
+    for(let x=2;x<6;x++) pix(baseX+x*2, baseY, "#2b1a12");
+    pix(baseX+2*2, baseY+2*2, "#2b1a12");
+    pix(baseX+5*2, baseY+2*2, "#2b1a12");
+    // eyes
+    pix(baseX+3*2, baseY+2*2, "#101822");
+    pix(baseX+4*2, baseY+2*2, "#101822");
+
+    // body (shirt)
+    for(let y=3;y<7;y++) for(let x=2;x<6;x++) pix(baseX+x*2, baseY+y*2, "#6bd6ff");
+    // arms
+    for(let y=4;y<6;y++){
+      pix(baseX+1*2, baseY+y*2, "#ffd9b3");
+      pix(baseX+6*2, baseY+y*2, "#ffd9b3");
+    }
+    // belt
+    for(let x=2;x<6;x++) pix(baseX+x*2, baseY+6*2, "#223043");
+
+    // legs (pants)
+    for(let y=7;y<9;y++){
+      pix(baseX+2*2, baseY+y*2, "#8aa3bd");
+      pix(baseX+3*2, baseY+y*2, "#8aa3bd");
+      pix(baseX+4*2, baseY+y*2, "#8aa3bd");
+      pix(baseX+5*2, baseY+y*2, "#8aa3bd");
+    }
+    // shoes
+    pix(baseX+2*2, baseY+9*2, "#101822");
+    pix(baseX+5*2, baseY+9*2, "#101822");
+  }
+
+  function drawEnemy(e){
+    const px = e.x*TS, py = e.y*TS;
+
+    // base body
+    if(e.kind==="slime"){
+      ctx.fillStyle="#5dffb3";
+      ctx.fillRect(px+4, py+6, TS-8, TS-8);
+      // eyes
+      ctx.fillStyle="#101822";
+      ctx.fillRect(px+7, py+10, 3, 3);
+      ctx.fillRect(px+TS-10, py+10, 3, 3);
+      // highlight
+      ctx.fillStyle="rgba(255,255,255,0.25)";
+      ctx.fillRect(px+6, py+8, 6, 4);
+    } else {
+      // skeleton
+      ctx.fillStyle="#d7e0ea";
+      ctx.fillRect(px+6, py+5, TS-12, TS-10);
+      ctx.fillStyle="#101822";
+      ctx.fillRect(px+8, py+9, 3, 3);
+      ctx.fillRect(px+TS-11, py+9, 3, 3);
+      ctx.fillStyle="#223043";
+      ctx.fillRect(px+8, py+13, TS-16, 2);
+    }
+
+    // hp bar
+    const frac = clamp(e.hp / e.maxHp, 0, 1);
+    ctx.fillStyle="#223043";
+    ctx.fillRect(px+3, py+2, TS-6, 3);
+    ctx.fillStyle="#ff9a9a";
+    ctx.fillRect(px+3, py+2, Math.max(1, Math.floor((TS-6)*frac)), 3);
+  }
+
+  // ---------- Turns ----------
+  function tryMove(dx,dy){
+    if(player.hp<=0) return;
+
+    const nx = player.x + dx;
+    const ny = player.y + dy;
+
+    if(!inBounds(nx,ny)) return;
+
+    const e = enemyAt(nx,ny);
+    if(e){
+      hit(player, e);
+      if(e.hp<=0){
+        enemies = enemies.filter(x => x!==e);
+        player.gold += rint(3,10);
+        log(`You killed a ${e.kind}. +gold`);
+        if(enemies.length===0){
+          floorNum++;
+          log(`Floor cleared! Going deeper... (Floor ${floorNum})`);
+          genMap();
+        }
+      } else {
+        enemyTurn();
+      }
+      save();
+      render();
+      return;
+    }
+
+    if(walkable(nx,ny)){
+      player.x = nx; player.y = ny;
+      enemyTurn();
+      save();
+      render();
+    }
+  }
+
+  function hit(a,b){
+    const dmg = rollDamage(a.atk, b.def);
+    b.hp -= dmg;
+    const an = (a===player) ? "You" : "Enemy";
+    const bn = (b===player) ? "you" : `the ${b.kind}`;
+    log(`${an} hit ${bn} for ${dmg}.`);
+  }
+
+  function attackButton(){
+    if(player.hp<=0) return;
+    // attack any adjacent enemy (priority: up, right, down, left)
+    const dirs = [{x:0,y:-1},{x:1,y:0},{x:0,y:1},{x:-1,y:0}];
+    for(const d of dirs){
+      const e = enemyAt(player.x+d.x, player.y+d.y);
+      if(e){
+        hit(player, e);
+        if(e.hp<=0){
+          enemies = enemies.filter(x => x!==e);
+          player.gold += rint(3,10);
+          log(`You killed a ${e.kind}. +gold`);
+          if(enemies.length===0){
+            floorNum++;
+            log(`Floor cleared! Going deeper... (Floor ${floorNum})`);
+            genMap();
+          }
+        } else {
+          enemyTurn();
+        }
+        save();
+        render();
+        return;
+      }
+    }
+    log("No enemy adjacent.");
+    enemyTurn();
+    save();
+    render();
+  }
+
+  function usePotion(){
+    if(player.potions<=0){ log("No potions."); return; }
+    if(player.hp>=player.maxHp){ log("HP full."); return; }
+    player.potions--;
+    const heal = rint(8,12);
+    player.hp = Math.min(player.maxHp, player.hp + heal);
+    log(`Potion +${heal} HP.`);
+    enemyTurn();
+    save();
+    render();
+  }
+
+  function enemyTurn(){
+    for(const e of enemies){
+      if(player.hp<=0) return;
+
+      const dx = player.x - e.x;
+      const dy = player.y - e.y;
+      const dist = Math.abs(dx) + Math.abs(dy);
+
+      // attack if adjacent
+      if(dist === 1){
+        hit(e, player);
+        if(player.hp<=0){
+          player.hp = 0;
+          log("You died 💀 (Reset)");
+        }
+        continue;
+      }
+
+      // move toward player, but don't clip into walls/other enemies
+      const stepX = dx===0 ? 0 : (dx>0 ? 1 : -1);
+      const stepY = dy===0 ? 0 : (dy>0 ? 1 : -1);
+
+      // choose axis randomly
+      const options = (Math.random()<0.5)
+        ? [{x:e.x+stepX, y:e.y}, {x:e.x, y:e.y+stepY}]
+        : [{x:e.x, y:e.y+stepY}, {x:e.x+stepX, y:e.y}];
+
+      for(const o of options){
+        if(tile(o.x,o.y)===T_FLOOR && !enemyAt(o.x,o.y) && !(o.x===player.x && o.y===player.y)){
+          e.x=o.x; e.y=o.y;
+          break;
+        }
+      }
+    }
+  }
+
+  // ---------- Render ----------
+  function render(){
+    // draw map
+    for(let y=0;y<H;y++){
+      for(let x=0;x<W;x++){
+        drawTile(x,y,map[y][x]);
+      }
+    }
+
+    // enemies
+    for(const e of enemies) drawEnemy(e);
+
+    // player (pixel person)
+    drawPixelPerson(player.x, player.y);
+
+    // UI
+    statsEl.textContent =
+`Floor: ${floorNum}
+HP: ${player.hp}/${player.maxHp}
+ATK: ${player.atk}  DEF: ${player.def}
+Potions: ${player.potions}
+Gold: ${player.gold}
+Enemies: ${enemies.length}
+
+Tip: Walk into an enemy to attack
+or press ⚔️ if adjacent.`;
+
+    if(player.hp<=0){
+      log("Press Reset to start again.");
+    }
+  }
+
+  // ---------- Save / Load ----------
+  function save(){
+    const data = { map, player, enemies, floorNum };
+    try { localStorage.setItem(SAVE_KEY, JSON.stringify(data)); } catch {}
+  }
+
+  function load(){
+    try{
+      const raw = localStorage.getItem(SAVE_KEY);
+      if(!raw) return false;
+      const data = JSON.parse(raw);
+      if(!data || !data.map || !data.player) return false;
+      map = data.map;
+      player = data.player;
+      enemies = data.enemies || [];
+      floorNum = data.floorNum || 1;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function hardReset(){
+    localStorage.removeItem(SAVE_KEY);
+    floorNum = 1;
+    logEl.textContent = "";
+    log("New run.");
+    genMap();
+    save();
+    render();
+  }
+
+  // ---------- Controls ----------
+  function bindHold(btn, fn){
+    let t=null;
+    const start = (e)=>{ e.preventDefault(); fn(); t=setInterval(fn, 140); };
+    const stop = ()=>{ if(t){ clearInterval(t); t=null; } };
+    btn.addEventListener("touchstart", start, {passive:false});
+    btn.addEventListener("touchend", stop, {passive:true});
+    btn.addEventListener("touchcancel", stop, {passive:true});
+    btn.addEventListener("mousedown", start);
+    btn.addEventListener("mouseup", stop);
+    btn.addEventListener("mouseleave", stop);
+  }
+
+  bindHold(document.getElementById("up"),    ()=>tryMove(0,-1));
+  bindHold(document.getElementById("down"),  ()=>tryMove(0, 1));
+  bindHold(document.getElementById("left"),  ()=>tryMove(-1,0));
+  bindHold(document.getElementById("right"), ()=>tryMove(1, 0));
+
+  document.getElementById("atk").addEventListener("click", attackButton);
+  document.getElementById("pot").addEventListener("click", usePotion);
+  document.getElementById("reset").addEventListener("click", hardReset);
+
+  // ---------- Boot ----------
+  if(load()){
+    log("Loaded save.");
+  } else {
+    log("New run.");
+    genMap();
+    save();
+  }
+  render();
+})();
+</script>
+</body>
+</html>
